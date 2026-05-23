@@ -1,0 +1,4 @@
+-keep class com.google.mlkit.** { *; }
+-keep class org.tensorflow.lite.** { *; }
+-dontwarn com.google.mlkit.**
+-dontwarn org.tensorflow.lite.**
