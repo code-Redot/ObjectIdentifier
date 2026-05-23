@@ -127,4 +127,4 @@ Declared in [AndroidManifest.xml](android/app/src/main/AndroidManifest.xml):
 
 ## License
 
-[MIT](LICENSE) — replace the copyright holder ("Object Identifier Contributors") with your name before publishing.
+[MIT](LICENSE) © 2026 [code-Redot](https://github.com/code-Redot).
