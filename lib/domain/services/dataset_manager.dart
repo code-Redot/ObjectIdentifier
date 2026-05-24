@@ -207,7 +207,7 @@ class DatasetManager {
     }
   }
 
-  /// Update item color
+  /// Update item color (single item).
   Future<bool> updateItemColor(String itemId, Color newColor) async {
     try {
       final item = await _repository.getItemById(itemId);
@@ -215,13 +215,33 @@ class DatasetManager {
 
       final updated = item.copyWith(colorValue: newColor.value);
       await _repository.updateItem(updated);
-      
+
       debugPrint('✓ Color updated for: ${item.name}');
       return true;
     } catch (e) {
       debugPrint('✗ Error updating color: $e');
       return false;
     }
+  }
+
+  /// Update color for ALL items that share the given group name.
+  /// Returns the number of items updated.
+  Future<int> updateGroupColor(String groupName, Color newColor) async {
+    int updated = 0;
+    try {
+      final items = await _repository.getAllItems();
+      for (final item in items) {
+        if (item.name != groupName) continue;
+        await _repository.updateItem(
+          item.copyWith(colorValue: newColor.value),
+        );
+        updated++;
+      }
+      debugPrint('✓ Color updated for $updated items in group "$groupName"');
+    } catch (e) {
+      debugPrint('✗ Error updating group color: $e');
+    }
+    return updated;
   }
 
   /// Update item name

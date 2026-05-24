@@ -15,14 +15,21 @@ class AppConstants {
   static const int embeddingDimension = 1280;
   
   // Recognition Configuration
-  static const double similarityThreshold = 0.72; // Cosine similarity threshold
-  static const int maxMatchResults = 5; // Max simultaneous detections
-  static const int resultAggregationFrames = 3; // Frames to aggregate for stability
-  
-  // Camera Configuration - Optimized for S23/S24
-  static const int targetFrameRate = 30; // Camera capture FPS
-  static const int processingFrameRate = 6; // ML inference FPS (every 5th frame)
-  static const int frameSkipRatio = 5; // Process every Nth frame
+  // MobileNetV3 cross-view cosine similarity for the same physical object
+  // typically falls in 0.55–0.80 once you account for crop/lighting/angle.
+  // Tighter thresholds will reject real matches; looser thresholds cause
+  // false positives across visually similar classes.
+  static const double similarityThreshold = 0.55;
+  static const int maxMatchResults = 3;
+  static const int resultAggregationFrames = 3;
+
+  // Camera Configuration
+  static const int targetFrameRate = 30;
+  // Process every Nth frame. Higher = better UI smoothness, lower inference
+  // throughput. With maxRois ≤ 2 and CPU inference, 8 keeps the UI responsive
+  // and still gives ~3.5 inferences/sec.
+  static const int frameSkipRatio = 8;
+  static const int processingFrameRate = targetFrameRate ~/ frameSkipRatio;
   
   // S23/S24 optimal resolution for balance between quality and performance
   static const int cameraWidth = 1920;
@@ -39,8 +46,15 @@ class AppConstants {
   static const double confidenceLabelFontSize = 14.0;
   
   // Performance tuning. NNAPI is no longer shipped by tflite_flutter (Google
-  // deprecated it in favor of GPU + XNNPACK), so we only toggle the GPU path.
-  static const bool useGpuDelegate = true;
+  // deprecated it in favor of GPU + XNNPACK).
+  //
+  // GPU delegate is OFF by default: it works while the app is in foreground
+  // but its EGL/CL context can be torn down when Android pauses the activity
+  // (e.g. when image_picker launches the system camera), which leaves the
+  // interpreter in a state where the next invoke() fails with
+  // "Bad state: failed precondition". CPU + XNNPACK is fast enough for
+  // MobileNetV3 Large @ 224 and survives lifecycle events cleanly.
+  static const bool useGpuDelegate = false;
   static const int numThreads = 4;
   
   // OCR Configuration

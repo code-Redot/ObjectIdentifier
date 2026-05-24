@@ -146,6 +146,37 @@ class DatasetProvider with ChangeNotifier {
     }
   }
 
+  /// Update color across every item sharing the given group name.
+  /// Items are grouped by `name` in the UI, so this keeps the cohort
+  /// visually consistent (one colour per real-world object).
+  Future<bool> updateGroupColor(String groupName, Color newColor) async {
+    try {
+      if (!ColorPalette.isValidColor(newColor)) {
+        _error = 'Invalid color: must be high-contrast';
+        notifyListeners();
+        return false;
+      }
+
+      final updated = await _datasetManager.updateGroupColor(groupName, newColor);
+      if (updated == 0) return false;
+
+      bool changed = false;
+      for (int i = 0; i < _items.length; i++) {
+        if (_items[i].name == groupName) {
+          _items[i] = _items[i].copyWith(colorValue: newColor.value);
+          changed = true;
+        }
+      }
+      if (changed) notifyListeners();
+      return true;
+    } catch (e) {
+      _error = 'Failed to update group color: $e';
+      debugPrint('✗ $_error');
+      notifyListeners();
+      return false;
+    }
+  }
+
   /// Update item color (in-place — avoids reloading entire dataset).
   Future<bool> updateItemColor(String itemId, Color newColor) async {
     try {

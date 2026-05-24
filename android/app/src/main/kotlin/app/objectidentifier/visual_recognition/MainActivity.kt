@@ -1,4 +1,4 @@
-package com.example.visual_recognition_app
+package app.objectidentifier.visual_recognition
 
 import io.flutter.embedding.android.FlutterActivity
 

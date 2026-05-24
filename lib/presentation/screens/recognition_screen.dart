@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
 import 'package:provider/provider.dart';
+import '../../domain/services/camera_service.dart';
 import '../../domain/services/recognition_service.dart';
 import '../providers/dataset_provider.dart';
 import '../providers/recognition_provider.dart';
@@ -20,64 +21,100 @@ class _RecognitionScreenState extends State<RecognitionScreen>
   bool _isInitialized = false;
   bool _showStats = false;
 
+  // Cached provider references. We MUST NOT call context.read() from dispose()
+  // or from async teardown — by then context.widget is null and the
+  // InheritedWidget lookup throws "Null check operator used on a null value".
+  // didChangeDependencies is the canonical place to capture these once.
+  RecognitionProvider? _recognitionProvider;
+  DatasetProvider? _datasetProvider;
+  RecognitionService? _recognitionService;
+  CameraService? _cameraService;
+
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _initializeCamera();
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _recognitionProvider = context.read<RecognitionProvider>();
+    _datasetProvider = context.read<DatasetProvider>();
+    _recognitionService = context.read<RecognitionService>();
+    _cameraService = _recognitionProvider!.cameraService;
+
+    // First time only: kick off camera init now that providers are wired.
+    if (!_isInitialized) {
+      _initializeCamera();
+    }
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    // Fire-and-forget; we cannot await inside dispose. Uses cached refs only.
     _disposeCamera();
     super.dispose();
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    final recognitionProvider = context.read<RecognitionProvider>();
-    final cameraService = recognitionProvider.cameraService;
-
-    if (!cameraService.isInitialized) return;
+    final cameraService = _cameraService;
+    final recognitionProvider = _recognitionProvider;
+    if (cameraService == null || !cameraService.isInitialized) return;
 
     if (state == AppLifecycleState.inactive) {
       cameraService.pause();
     } else if (state == AppLifecycleState.resumed) {
       cameraService.resume();
-      if (recognitionProvider.isRecognizing) {
+      if (recognitionProvider?.isRecognizing ?? false) {
         _startRecognition();
       }
     }
   }
 
   Future<void> _initializeCamera() async {
-    final recognitionProvider = context.read<RecognitionProvider>();
-    final cameraService = recognitionProvider.cameraService;
+    final cameraService = _cameraService;
+    if (cameraService == null) return;
 
     final success = await cameraService.initialize();
+    if (!mounted) return;
     if (success) {
       setState(() => _isInitialized = true);
     } else {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Failed to initialize camera')),
-        );
-      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Failed to initialize camera')),
+      );
     }
   }
 
   Future<void> _disposeCamera() async {
-    final recognitionProvider = context.read<RecognitionProvider>();
-    await _stopRecognition();
-    await recognitionProvider.cameraService.dispose();
+    final cameraService = _cameraService;
+    final recognitionProvider = _recognitionProvider;
+    if (cameraService == null) return;
+    try {
+      if (cameraService.isStreaming) {
+        await cameraService.stopFrameStream();
+      }
+      recognitionProvider?.stopRecognition();
+      await cameraService.dispose();
+    } catch (_) {
+      // Best-effort teardown — never throw out of dispose.
+    }
   }
 
   Future<void> _startRecognition() async {
-    final recognitionProvider = context.read<RecognitionProvider>();
-    final datasetProvider = context.read<DatasetProvider>();
-    final cameraService = recognitionProvider.cameraService;
-    final recognitionService = context.read<RecognitionService>();
+    final recognitionProvider = _recognitionProvider;
+    final datasetProvider = _datasetProvider;
+    final recognitionService = _recognitionService;
+    final cameraService = _cameraService;
+    if (recognitionProvider == null ||
+        datasetProvider == null ||
+        recognitionService == null ||
+        cameraService == null) {
+      return;
+    }
 
     if (datasetProvider.items.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -88,22 +125,15 @@ class _RecognitionScreenState extends State<RecognitionScreen>
 
     recognitionProvider.startRecognition();
 
-    // CRITICAL FIX: Memory leak prevention
-    // Check mounted BEFORE async operations to prevent accessing disposed providers
     cameraService.startFrameStream((cameraImage) async {
-      // ENFORCEMENT: Check mounted state immediately
-      if (!mounted) return; // Widget disposed, stop processing
-      
+      if (!mounted) return;
       recognitionProvider.incrementTotalFrames();
 
-      // MANDATORY: 5 FPS enforcement with frame dropping
-      // RecognitionService has hard lock - will drop frame if still processing
       final results = await recognitionService.processFrame(
         cameraImage: cameraImage,
         dataset: datasetProvider.items,
       );
 
-      // CRITICAL FIX: Check mounted again after async operation
       if (mounted) {
         recognitionProvider.updateResults(results);
       }
@@ -111,11 +141,14 @@ class _RecognitionScreenState extends State<RecognitionScreen>
   }
 
   Future<void> _stopRecognition() async {
-    final recognitionProvider = context.read<RecognitionProvider>();
-    final cameraService = recognitionProvider.cameraService;
+    final recognitionProvider = _recognitionProvider;
+    final cameraService = _cameraService;
+    if (recognitionProvider == null || cameraService == null) return;
 
     recognitionProvider.stopRecognition();
-    await cameraService.stopFrameStream();
+    if (cameraService.isStreaming) {
+      await cameraService.stopFrameStream();
+    }
   }
 
   @override
@@ -310,11 +343,16 @@ class _RecognitionScreenState extends State<RecognitionScreen>
 
   Widget _buildStatsOverlay(RecognitionProvider recognitionProvider) {
     final stats = recognitionProvider.getStats();
-    
+    final svc = _recognitionService;
+    final bestSim = svc?.lastBestSimilarity ?? 0.0;
+    final bestName = svc?.lastBestItemName ?? '—';
+    final frameMs = svc?.lastFrameMs ?? 0;
+    final rois = svc?.lastRoiCount ?? 0;
+
     return Container(
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
-        color: Colors.black.withOpacity(0.7),
+        color: Colors.black.withOpacity(0.75),
         borderRadius: BorderRadius.circular(8),
       ),
       child: Column(
@@ -322,7 +360,7 @@ class _RecognitionScreenState extends State<RecognitionScreen>
         mainAxisSize: MainAxisSize.min,
         children: [
           const Text(
-            'Statistics',
+            'Diagnostics',
             style: TextStyle(
               color: Colors.white,
               fontWeight: FontWeight.bold,
@@ -330,9 +368,15 @@ class _RecognitionScreenState extends State<RecognitionScreen>
             ),
           ),
           const SizedBox(height: 8),
+          _buildStatRow('Inference', '${frameMs}ms'),
+          _buildStatRow('ROIs/frame', '$rois'),
+          _buildStatRow('Best score', bestSim.toStringAsFixed(3)),
+          _buildStatRow('Best item', bestName.length > 14
+              ? '${bestName.substring(0, 14)}…'
+              : bestName),
+          const Divider(color: Colors.white24, height: 16),
           _buildStatRow('Processed', '${stats['framesProcessed']}'),
           _buildStatRow('Total', '${stats['totalFrames']}'),
-          _buildStatRow('Rate', '${stats['processingRate']}%'),
           _buildStatRow('Matches', '${stats['currentMatches']}'),
         ],
       ),

@@ -18,6 +18,19 @@ class RecognitionService {
   
   bool _isProcessing = false;
   final Map<String, AggregatedResult> _aggregatedResults = {};
+
+  // Diagnostics — useful for tuning the similarity threshold and seeing
+  // whether the inference pipeline is healthy. These are updated every frame
+  // regardless of whether anything cleared the threshold.
+  int _lastFrameMs = 0;
+  int _lastRoiCount = 0;
+  double _lastBestSimilarity = 0.0;
+  String? _lastBestItemName;
+
+  int get lastFrameMs => _lastFrameMs;
+  int get lastRoiCount => _lastRoiCount;
+  double get lastBestSimilarity => _lastBestSimilarity;
+  String? get lastBestItemName => _lastBestItemName;
   
   RecognitionService({
     required MLService mlService,
@@ -46,6 +59,7 @@ class RecognitionService {
     }
 
     _isProcessing = true;
+    final stopwatch = Stopwatch()..start();
 
     try {
       final preprocessedRois = await ImageUtils.processCameraFrameFullPipeline(
@@ -54,6 +68,7 @@ class RecognitionService {
         modelHeight: AppConstants.modelInputHeight,
       );
 
+      _lastRoiCount = preprocessedRois?.length ?? 0;
       if (preprocessedRois == null || preprocessedRois.isEmpty) {
         return [];
       }
@@ -65,6 +80,8 @@ class RecognitionService {
       debugPrint('Error processing frame: $e');
       return [];
     } finally {
+      stopwatch.stop();
+      _lastFrameMs = stopwatch.elapsedMilliseconds;
       _isProcessing = false;
     }
   }
@@ -109,16 +126,23 @@ class RecognitionService {
   ) {
     final results = <RecognitionResult>[];
 
-    // EMBEDDING CACHE ENFORCEMENT:
-    // item.embedding is ALWAYS from cache (computed at import time)
-    // queryEmbedding is the ONLY fresh computation (from current frame ROI)
+    // Track best-of-frame for diagnostics, even below the threshold — lets
+    // the debug HUD show "what's the highest score the model saw?" so the
+    // similarity threshold can be tuned without guessing.
+    double bestSim = _lastBestSimilarity;
+    String? bestName = _lastBestItemName;
+
     for (final item in dataset) {
       final similarity = _mlService.calculateSimilarity(
         queryEmbedding,
-        item.embedding, // CACHED - never recomputed
+        item.embedding,
       );
 
-      // Check if similarity meets threshold
+      if (similarity > bestSim) {
+        bestSim = similarity;
+        bestName = item.name;
+      }
+
       if (similarity >= AppConstants.similarityThreshold) {
         results.add(RecognitionResult(
           matchedItem: item,
@@ -127,10 +151,10 @@ class RecognitionService {
       }
     }
 
-    // Sort by confidence (highest first)
-    results.sort((a, b) => b.confidence.compareTo(a.confidence));
+    _lastBestSimilarity = bestSim;
+    _lastBestItemName = bestName;
 
-    // Return top matches
+    results.sort((a, b) => b.confidence.compareTo(a.confidence));
     return results.take(AppConstants.maxMatchResults).toList();
   }
 
@@ -268,6 +292,10 @@ class RecognitionService {
   /// Reset aggregation (call when switching modes or clearing)
   void resetAggregation() {
     _aggregatedResults.clear();
+    _lastFrameMs = 0;
+    _lastRoiCount = 0;
+    _lastBestSimilarity = 0.0;
+    _lastBestItemName = null;
   }
 
   /// Check if currently processing

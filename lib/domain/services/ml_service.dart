@@ -101,7 +101,7 @@ class MLService {
         AppConstants.modelInputWidth,
         AppConstants.modelInputHeight,
       );
-      return _runInference(inputData);
+      return await _runInferenceWithRecovery(inputData);
     } catch (e, stack) {
       debugPrint('✗ Error extracting embedding: $e\n$stack');
       rethrow;
@@ -114,38 +114,96 @@ class MLService {
       return null;
     }
     try {
-      return _runInference(imageData);
+      return await _runInferenceWithRecovery(imageData);
     } catch (e) {
       debugPrint('✗ Error in inference: $e');
       return null;
     }
   }
 
-  /// Shared inference path. Writes directly to the input tensor buffer and
-  /// reads the output as a Float32List — avoids the per-frame allocation of
-  /// nested `List<List<double>>` wrappers that the prior reshape required.
+  /// Inference with one recovery attempt: if the underlying native call fails
+  /// (typical cause: GPU delegate's EGL/CL context was lost while the activity
+  /// was paused for the system camera, or the interpreter otherwise entered a
+  /// bad state), close + reopen the interpreter and retry once. If the retry
+  /// also fails, rethrow the original diagnostic-rich error.
+  Future<List<double>?> _runInferenceWithRecovery(Float32List imageData) async {
+    try {
+      return _runInference(imageData);
+    } catch (firstError, firstStack) {
+      debugPrint('⚠ Inference failed, attempting interpreter reinit: $firstError');
+      try {
+        _interpreter?.close();
+      } catch (_) {/* ignore — already closed or broken */}
+      _interpreter = null;
+      _isInitialized = false;
+
+      final reinit = await initialize(modelPath: _currentModelPath);
+      if (!reinit) {
+        debugPrint('✗ Reinit failed — surfacing original error');
+        Error.throwWithStackTrace(firstError, firstStack);
+      }
+
+      try {
+        final result = _runInference(imageData);
+        debugPrint('✓ Inference recovered after interpreter reinit');
+        return result;
+      } catch (retryError) {
+        debugPrint('✗ Inference still failing after reinit: $retryError');
+        Error.throwWithStackTrace(firstError, firstStack);
+      }
+    }
+  }
+
+  /// Single inference attempt. Throws a diagnostic StateError on failure.
+  /// `Tensor.data` in tflite_flutter 0.11 is an UnmodifiableUint8ListView, so
+  /// the documented inference path is `Interpreter.run(reshapedInput, output)`.
   List<double>? _runInference(Float32List imageData) {
     final interpreter = _interpreter;
     if (interpreter == null) return null;
 
-    final inputTensor = interpreter.getInputTensor(0);
-    final inputBuffer = inputTensor.data.buffer.asFloat32List();
-    if (inputBuffer.length != imageData.length) {
+    final expected = AppConstants.modelInputWidth *
+        AppConstants.modelInputHeight *
+        AppConstants.modelInputChannels;
+    if (imageData.length != expected) {
       debugPrint(
-          '✗ Input tensor size mismatch: tensor=${inputBuffer.length} '
-          'data=${imageData.length}');
+          '✗ Input size mismatch: got=${imageData.length} expected=$expected');
       return null;
     }
-    inputBuffer.setAll(0, imageData);
 
-    interpreter.invoke();
+    final input = imageData.reshape<double>([
+      1,
+      AppConstants.modelInputHeight,
+      AppConstants.modelInputWidth,
+      AppConstants.modelInputChannels,
+    ]);
+    // tflite_flutter's output reader produces a List<List<double>> and writes
+    // the inner list straight into output[0]. The slot must be `List<double>`
+    // — a Float32List slot would TypeError ("List<double> is not Float32List").
+    final output = <List<double>>[
+      List<double>.filled(AppConstants.embeddingDimension, 0.0),
+    ];
 
-    final outputTensor = interpreter.getOutputTensor(0);
-    final outputBuffer = outputTensor.data.buffer.asFloat32List();
-    // Defensive: copy the output so the next invocation can't mutate it
-    // underneath us (the tensor backing buffer is reused).
-    final embedding = Float32List.fromList(outputBuffer);
-    return _normalizeEmbedding(embedding);
+    try {
+      interpreter.run(input, output);
+    } catch (e) {
+      // tflite_flutter wraps native failures in `checkState` which throws
+      // `StateError('failed precondition')` — useless on its own. Annotate
+      // with the tensor shape so we know which side mismatched, and dump the
+      // model's declared shape for comparison.
+      final inT = interpreter.getInputTensor(0);
+      final outT = interpreter.getOutputTensor(0);
+      throw StateError(
+        'TFLite inference failed: $e\n'
+        '  input tensor: shape=${inT.shape} type=${inT.type}\n'
+        '  output tensor: shape=${outT.shape} type=${outT.type}\n'
+        '  supplied input flat-length=${imageData.length} '
+        '(expected ${AppConstants.modelInputWidth * AppConstants.modelInputHeight * AppConstants.modelInputChannels})\n'
+        '  supplied output slot length=${output[0].length} '
+        '(expected ${AppConstants.embeddingDimension})',
+      );
+    }
+
+    return _normalizeEmbedding(output[0]);
   }
 
   /// Normalize embedding vector to unit length (L2). Required for cosine

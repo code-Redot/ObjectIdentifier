@@ -64,8 +64,12 @@ android {
             } else {
                 signingConfigs.getByName("debug")
             }
-            isMinifyEnabled = true
-            isShrinkResources = true
+            // R8 / resource shrinking disabled for v1.0.0 — it was stripping
+            // classes used reflectively by hive / flutter_secure_storage
+            // and causing an immediate crash on launch. Re-enable once the
+            // proguard-rules.pro file covers those keep rules.
+            isMinifyEnabled = false
+            isShrinkResources = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"

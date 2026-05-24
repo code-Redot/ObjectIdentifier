@@ -182,7 +182,7 @@ class _DatasetScreenState extends State<DatasetScreen> {
                           }
                         }
                       },
-                      onColorChange: () => _showColorPicker(context, firstItem.id),
+                      onColorChange: () => _showGroupColorPicker(context, groupName, Color(firstItem.colorValue)),
                     );
                   },
                 );
@@ -267,15 +267,16 @@ class _DatasetScreenState extends State<DatasetScreen> {
     );
   }
 
-  void _showColorPicker(BuildContext context, String itemId) {
+  /// Cascades the chosen colour to every item in the group — one colour per
+  /// real-world object, not per individual photo.
+  void _showGroupColorPicker(BuildContext context, String groupName, Color initial) {
     final provider = context.read<DatasetProvider>();
-    final item = provider.items.firstWhere((i) => i.id == itemId);
-    Color selectedColor = Color(item.colorValue);
+    Color selectedColor = initial;
 
     showDialog(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('Choose Color'),
+        title: Text('Colour for "$groupName"'),
         content: SingleChildScrollView(
           child: BlockPicker(
             pickerColor: selectedColor,
@@ -290,10 +291,10 @@ class _DatasetScreenState extends State<DatasetScreen> {
           ),
           ElevatedButton(
             onPressed: () async {
-              await provider.updateItemColor(itemId, selectedColor);
+              await provider.updateGroupColor(groupName, selectedColor);
               if (context.mounted) Navigator.pop(context);
             },
-            child: const Text('Save'),
+            child: const Text('Apply to group'),
           ),
         ],
       ),
@@ -344,74 +345,74 @@ class _AddItemDialogState extends State<_AddItemDialog> {
   @override
   Widget build(BuildContext context) {
     return AlertDialog(
-      title: const Text('Add New Item'),
-      content: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          TextField(
-            controller: _nameController,
-            decoration: const InputDecoration(
-              labelText: 'Item Name',
-              border: OutlineInputBorder(),
-            ),
-            autofocus: true,
-          ),
-          const SizedBox(height: 16),
-          Row(
-            children: [
-              const Text('Color: '),
-              const SizedBox(width: 8),
-              GestureDetector(
-                onTap: () => _showColorPicker(),
-                child: Container(
-                  width: 40,
-                  height: 40,
-                  decoration: BoxDecoration(
-                    color: _selectedColor,
-                    border: Border.all(color: Colors.grey),
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                ),
+      title: const Text('Add new item'),
+      content: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 360),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            TextField(
+              controller: _nameController,
+              decoration: const InputDecoration(
+                labelText: 'Item name',
+                hintText: 'e.g. "Coffee mug"',
+                prefixIcon: Icon(Icons.label_outline),
               ),
-            ],
-          ),
-        ],
+              autofocus: true,
+              textInputAction: TextInputAction.done,
+              onChanged: (_) => setState(() {}),
+            ),
+            const SizedBox(height: 16),
+            const Text('Group colour', style: TextStyle(fontWeight: FontWeight.w500)),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                for (final c in ColorPalette.defaultColors)
+                  GestureDetector(
+                    onTap: () => setState(() => _selectedColor = c),
+                    child: Container(
+                      width: 32,
+                      height: 32,
+                      decoration: BoxDecoration(
+                        color: c,
+                        shape: BoxShape.circle,
+                        border: Border.all(
+                          color: _selectedColor.value == c.value
+                              ? Theme.of(context).colorScheme.onSurface
+                              : Colors.transparent,
+                          width: 3,
+                        ),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ],
+        ),
       ),
       actions: [
         TextButton(
           onPressed: () => Navigator.pop(context),
           child: const Text('Cancel'),
         ),
-        ElevatedButton.icon(
-          onPressed: () => _addFromCamera(context),
-          icon: const Icon(Icons.camera_alt),
-          label: const Text('Camera'),
-        ),
-        ElevatedButton.icon(
-          onPressed: () => _addFromGallery(context),
+        FilledButton.tonalIcon(
+          onPressed: _nameController.text.trim().isEmpty
+              ? null
+              : () => _addFromGallery(context),
           icon: const Icon(Icons.photo),
           label: const Text('Gallery'),
         ),
-      ],
-    );
-  }
-
-  void _showColorPicker() {
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Choose Color'),
-        content: SingleChildScrollView(
-          child: BlockPicker(
-            pickerColor: _selectedColor,
-            availableColors: ColorPalette.defaultColors,
-            onColorChanged: (color) {
-              setState(() => _selectedColor = color);
-              Navigator.pop(context);
-            },
-          ),
+        FilledButton.icon(
+          onPressed: _nameController.text.trim().isEmpty
+              ? null
+              : () => _addFromCamera(context),
+          icon: const Icon(Icons.camera_alt),
+          label: const Text('Camera'),
         ),
-      ),
+      ],
     );
   }
 
@@ -422,22 +423,7 @@ class _AddItemDialogState extends State<_AddItemDialog> {
       );
       return;
     }
-
-    final currentContext = context;
-    final scaffoldMessenger = ScaffoldMessenger.of(currentContext);
-    final provider = currentContext.read<DatasetProvider>();
-    final name = _nameController.text.trim();
-    final color = _selectedColor;
-
-    Navigator.pop(currentContext);
-    
-    final success = await provider.addItemFromCamera(name, color);
-
-    scaffoldMessenger.showSnackBar(
-      SnackBar(
-        content: Text(success ? 'Item added successfully' : provider.error ?? 'Failed to add item'),
-      ),
-    );
+    await _runAdd(context, fromCamera: true);
   }
 
   Future<void> _addFromGallery(BuildContext context) async {
@@ -447,20 +433,62 @@ class _AddItemDialogState extends State<_AddItemDialog> {
       );
       return;
     }
+    await _runAdd(context, fromCamera: false);
+  }
 
-    final currentContext = context;
-    final scaffoldMessenger = ScaffoldMessenger.of(currentContext);
-    final provider = currentContext.read<DatasetProvider>();
+  /// Shared add flow. We MUST capture `ScaffoldMessenger` and a long-lived
+  /// context (the root overlay) BEFORE popping the dialog — once popped, the
+  /// dialog's own BuildContext is dead and any `*.of(deadContext)` lookup
+  /// throws "Null check operator used on a null value".
+  Future<void> _runAdd(BuildContext dialogContext,
+      {required bool fromCamera}) async {
+    final scaffoldMessenger = ScaffoldMessenger.of(dialogContext);
+    final overlayContext =
+        Navigator.of(dialogContext, rootNavigator: true).overlay!.context;
+    final provider = dialogContext.read<DatasetProvider>();
     final name = _nameController.text.trim();
     final color = _selectedColor;
 
-    Navigator.pop(currentContext);
-    
-    final success = await provider.addItemFromGallery(name, color);
+    Navigator.pop(dialogContext);
 
-    scaffoldMessenger.showSnackBar(
-      SnackBar(
-        content: Text(success ? 'Item added successfully' : provider.error ?? 'Failed to add item'),
+    final success = fromCamera
+        ? await provider.addItemFromCamera(name, color)
+        : await provider.addItemFromGallery(name, color);
+
+    if (success) {
+      scaffoldMessenger.showSnackBar(
+        const SnackBar(content: Text('Item added successfully')),
+      );
+    } else {
+      _showAddError(overlayContext, provider.error ?? 'Unknown error');
+    }
+  }
+
+  /// Long / multi-line error messages don't fit in a SnackBar — show a
+  /// scrollable dialog. `context` must be a still-alive BuildContext (e.g.
+  /// the root overlay's), NOT the popped add-dialog context.
+  void _showAddError(BuildContext context, String message) {
+    if (!context.mounted) return;
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Failed to add item'),
+        content: ConstrainedBox(
+          constraints: const BoxConstraints(maxHeight: 360, maxWidth: 480),
+          child: SingleChildScrollView(
+            child: SelectableText(
+              message,
+              style: const TextStyle(
+                  fontFamily: 'monospace', fontSize: 12),
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('OK'),
+          ),
+        ],
       ),
     );
   }

@@ -12,7 +12,7 @@ class HomeScreen extends StatelessWidget {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Visual Recognition'),
+        title: const Text('Object Identifier'),
         elevation: 0,
       ),
       body: Consumer<DatasetProvider>(

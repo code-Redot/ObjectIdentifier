@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'dart:io';
@@ -25,12 +26,19 @@ class PreprocessedRoi {
 const int _kGridStep = 24;
 const int _kEdgeDeltaThreshold = 40;
 const int _kMinCellEdges = 4;
-const int _kMinClusterCells = 6;
-const int _kMaxRois = 5;
+// Maximum ROIs per frame. Each ROI = one model invocation, so this caps the
+// per-frame ML cost. 3 is a comfortable balance on CPU+XNNPACK.
+const int _kMaxRois = 3;
+// Minimum edge count for a cell to be considered a peak candidate.
+const int _kMinPeakEdges = 6;
+// Non-max-suppression radius (in grid cells). Two peaks closer than this
+// collapse to one — prevents the same object generating two overlapping ROIs.
+const int _kNmsRadiusCells = 8;
 
 class ImageUtils {
   /// Multi-ROI pipeline. Heavy YUV→RGB / clustering / reprojection work runs
-  /// on a worker isolate so the UI thread stays free.
+  /// on a long-lived worker isolate so the UI thread stays free AND we don't
+  /// pay isolate-spawn overhead on every frame.
   static Future<List<PreprocessedRoi>?> processCameraFrameFullPipeline(
     CameraImage cameraImage, {
     required int modelWidth,
@@ -51,9 +59,10 @@ class ImageUtils {
     );
 
     try {
-      return await Isolate.run(() => _runFramePipelineSync(job));
+      final worker = await _PipelineWorker.ensure();
+      return await worker.submit(job);
     } catch (e) {
-      debugPrint('Pipeline isolate error: $e');
+      debugPrint('Pipeline worker error: $e');
       return null;
     }
   }
@@ -182,6 +191,13 @@ class _Cluster {
   });
 }
 
+class _Peak {
+  final int cx;
+  final int cy;
+  final int density;
+  const _Peak({required this.cx, required this.cy, required this.density});
+}
+
 /// Runs the full YUV → multi-ROI pipeline synchronously.
 /// Top-level so it can be invoked inside `Isolate.run`.
 List<PreprocessedRoi> _runFramePipelineSync(_FrameJob job) {
@@ -224,87 +240,92 @@ List<PreprocessedRoi> _runFramePipelineSync(_FrameJob job) {
   }
 
   // ==========================================
-  // PHASE 2: CONNECTED COMPONENTS
+  // PHASE 2: PEAK DETECTION + NON-MAX SUPPRESSION
+  //
+  // Connected-components had the failure mode that adjacent objects merged
+  // into one big cluster (4-neighbour BFS bridges them through shared edges).
+  // Instead: find local maxima in the edge-density grid, rank by density,
+  // suppress peaks that are within `_kNmsRadiusCells` of a stronger one.
+  // This keeps the strongest few "centres of attention" as separate ROIs.
   // ==========================================
-  final Uint8List active = Uint8List(gridW * gridH);
-  for (int i = 0; i < edgeCount.length; i++) {
-    if (edgeCount[i] >= _kMinCellEdges) active[i] = 1;
+  final List<_Peak> peaks = [];
+  for (int cy = 1; cy < gridH - 1; cy++) {
+    for (int cx = 1; cx < gridW - 1; cx++) {
+      final int v = edgeCount[cy * gridW + cx];
+      if (v < _kMinPeakEdges) continue;
+      // 3x3 local max test
+      bool isMax = true;
+      for (int dy = -1; dy <= 1 && isMax; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+          if (dx == 0 && dy == 0) continue;
+          if (edgeCount[(cy + dy) * gridW + (cx + dx)] > v) {
+            isMax = false;
+            break;
+          }
+        }
+      }
+      if (isMax) peaks.add(_Peak(cx: cx, cy: cy, density: v));
+    }
+  }
+  peaks.sort((a, b) => b.density.compareTo(a.density));
+
+  final List<_Peak> kept = [];
+  for (final p in peaks) {
+    bool tooClose = false;
+    for (final s in kept) {
+      if ((s.cx - p.cx).abs() < _kNmsRadiusCells &&
+          (s.cy - p.cy).abs() < _kNmsRadiusCells) {
+        tooClose = true;
+        break;
+      }
+    }
+    if (!tooClose) {
+      kept.add(p);
+      if (kept.length >= _kMaxRois) break;
+    }
   }
 
-  final Uint8List visited = Uint8List(gridW * gridH);
+  // Window radius for each ROI, in cells. ~1/4 of the shorter grid dimension
+  // gives an ROI of ~25% of the frame, which scales cleanly into 224x224.
+  final int halfWin = max(3, min(gridW, gridH) ~/ 5);
+
   final List<_Cluster> clusters = [];
-  final List<int> stack = [];
-
-  for (int seed = 0; seed < active.length; seed++) {
-    if (active[seed] == 0 || visited[seed] == 1) continue;
-
-    int minCx = gridW, maxCx = -1, minCy = gridH, maxCy = -1;
-    int cellsInCluster = 0;
-
-    stack.add(seed);
-    visited[seed] = 1;
-    while (stack.isNotEmpty) {
-      final int cell = stack.removeLast();
-      final int cx = cell % gridW;
-      final int cy = cell ~/ gridW;
-      cellsInCluster++;
-      if (cx < minCx) minCx = cx;
-      if (cx > maxCx) maxCx = cx;
-      if (cy < minCy) minCy = cy;
-      if (cy > maxCy) maxCy = cy;
-
-      if (cx + 1 < gridW) {
-        final int ni = cell + 1;
-        if (active[ni] == 1 && visited[ni] == 0) {
-          visited[ni] = 1;
-          stack.add(ni);
-        }
-      }
-      if (cx - 1 >= 0) {
-        final int ni = cell - 1;
-        if (active[ni] == 1 && visited[ni] == 0) {
-          visited[ni] = 1;
-          stack.add(ni);
-        }
-      }
-      if (cy + 1 < gridH) {
-        final int ni = cell + gridW;
-        if (active[ni] == 1 && visited[ni] == 0) {
-          visited[ni] = 1;
-          stack.add(ni);
-        }
-      }
-      if (cy - 1 >= 0) {
-        final int ni = cell - gridW;
-        if (active[ni] == 1 && visited[ni] == 0) {
-          visited[ni] = 1;
-          stack.add(ni);
-        }
-      }
-    }
-
-    if (cellsInCluster >= _kMinClusterCells) {
-      clusters.add(_Cluster(
-        minX: minCx * _kGridStep,
-        maxX: (maxCx + 1) * _kGridStep,
-        minY: minCy * _kGridStep,
-        maxY: (maxCy + 1) * _kGridStep,
-        size: cellsInCluster,
-      ));
-    }
-  }
-
-  if (clusters.isEmpty) {
+  for (final p in kept) {
+    final int nMinX = max(0, (p.cx - halfWin) * _kGridStep);
+    final int nMaxX = min(inWidth, (p.cx + halfWin + 1) * _kGridStep);
+    final int nMinY = max(0, (p.cy - halfWin) * _kGridStep);
+    final int nMaxY = min(inHeight, (p.cy + halfWin + 1) * _kGridStep);
     clusters.add(_Cluster(
-      minX: (inWidth * 0.20).toInt(),
-      maxX: (inWidth * 0.80).toInt(),
-      minY: (inHeight * 0.20).toInt(),
-      maxY: (inHeight * 0.80).toInt(),
-      size: 0,
+      minX: nMinX,
+      maxX: nMaxX,
+      minY: nMinY,
+      maxY: nMaxY,
+      size: p.density,
     ));
   }
 
-  clusters.sort((a, b) => b.size.compareTo(a.size));
+  // Fallback when no peaks: probe four overlapping quadrants instead of one
+  // centre window — much higher chance of catching at least one real object.
+  if (clusters.isEmpty) {
+    final int hw = inWidth ~/ 2;
+    final int hh = inHeight ~/ 2;
+    // 60%-sized windows positioned at each quadrant centre; produces some
+    // overlap which is fine because NMS is over peaks, not over fallback ROIs.
+    final int wMargin = (inWidth * 0.10).toInt();
+    final int hMargin = (inHeight * 0.10).toInt();
+    void addBox(int x0, int y0, int x1, int y1) {
+      clusters.add(_Cluster(
+        minX: max(0, x0), maxX: min(inWidth, x1),
+        minY: max(0, y0), maxY: min(inHeight, y1),
+        size: 0,
+      ));
+    }
+    addBox(wMargin, hMargin, hw + wMargin, hh + hMargin);
+    addBox(hw - wMargin, hMargin, inWidth - wMargin, hh + hMargin);
+    addBox(wMargin, hh - hMargin, hw + wMargin, inHeight - hMargin);
+    addBox(hw - wMargin, hh - hMargin, inWidth - wMargin, inHeight - hMargin);
+  }
+
   final selected = clusters.take(_kMaxRois).toList(growable: false);
 
   // ==========================================
@@ -374,4 +395,83 @@ List<PreprocessedRoi> _runFramePipelineSync(_FrameJob job) {
   }
 
   return rois;
+}
+
+/// Long-lived worker isolate that runs `_runFramePipelineSync` on demand.
+/// Spawned once on the first frame and reused for the app lifetime — avoids
+/// the per-frame `Isolate.run` startup cost.
+class _PipelineWorker {
+  static _PipelineWorker? _instance;
+  static Future<_PipelineWorker>? _spawning;
+
+  static Future<_PipelineWorker> ensure() {
+    final cached = _instance;
+    if (cached != null) return Future.value(cached);
+    return _spawning ??= () async {
+      final w = _PipelineWorker._();
+      await w._spawn();
+      _instance = w;
+      _spawning = null;
+      return w;
+    }();
+  }
+
+  _PipelineWorker._();
+
+  late SendPort _sendPort;
+  late ReceivePort _resultPort;
+  final Map<int, Completer<List<PreprocessedRoi>>> _pending = {};
+  int _nextId = 0;
+
+  Future<void> _spawn() async {
+    _resultPort = ReceivePort();
+    final initPort = ReceivePort();
+    await Isolate.spawn(
+      _workerEntry,
+      <SendPort>[initPort.sendPort, _resultPort.sendPort],
+      debugName: 'visual-recognition-pipeline',
+    );
+    _sendPort = await initPort.first as SendPort;
+    initPort.close();
+    _resultPort.listen(_onResult);
+  }
+
+  void _onResult(dynamic msg) {
+    final list = msg as List;
+    final id = list[0] as int;
+    final payload = list[1];
+    final completer = _pending.remove(id);
+    if (completer == null || completer.isCompleted) return;
+    if (payload is List<PreprocessedRoi>) {
+      completer.complete(payload);
+    } else {
+      completer.complete(const <PreprocessedRoi>[]);
+    }
+  }
+
+  Future<List<PreprocessedRoi>> submit(_FrameJob job) {
+    final id = _nextId++;
+    final completer = Completer<List<PreprocessedRoi>>();
+    _pending[id] = completer;
+    _sendPort.send(<Object>[id, job]);
+    return completer.future;
+  }
+}
+
+void _workerEntry(List<SendPort> ports) {
+  final initPort = ports[0];
+  final resultPort = ports[1];
+  final commandPort = ReceivePort();
+  initPort.send(commandPort.sendPort);
+  commandPort.listen((dynamic msg) {
+    final list = msg as List;
+    final id = list[0] as int;
+    final job = list[1] as _FrameJob;
+    try {
+      final result = _runFramePipelineSync(job);
+      resultPort.send(<Object>[id, result]);
+    } catch (e) {
+      resultPort.send(<Object>[id, e.toString()]);
+    }
+  });
 }
